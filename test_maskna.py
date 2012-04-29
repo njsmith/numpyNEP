@@ -4,6 +4,9 @@ from numpy.testing import *
 import sys, warnings
 from numpy.testing.utils import WarningManager
 
+# The original code liked to check whether a and b shared memory (i.e., were a
+# view) by doing 'a.base is b'. This function is a more robust version of the
+# same idea:
 def share_base(a, b):
     a_base = a
     while a_base.base is not None:

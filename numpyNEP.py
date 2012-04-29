@@ -5,7 +5,7 @@
 #   - squeeze(axis=...)
 #   - np.copyto
 #   - ufunc.reduce works on scalars (e.g. logical_or.reduce(True))
-# Missing functions:
+# Functions that haven't been properly wrapped and probably won't work:
 #   - compress
 #   - extract
 #   - put
@@ -25,27 +25,39 @@
 #   - Haven't implemented payloads or dtypes for the NA object, it's just a
 #     strict singleton like None.
 #   - Haven't implemented casting= and preservena= arguments to copyto
-#   - Haven't implemented the logic to make np.diagonal return a view. (This
-#     has nothing to do with NAs, but it's tested by test_maskna.py).
-# Known limitations that are shared with Mark's code:
+#   - Haven't tried to make float64(1).flags.maskna work.
+# Known limitations that are shared with the code in master:
 #   - Not implemented: argmin, argmax, argsort, sort, searchsorted
 #   - tofile and tostring ignore the mask
 #   - np.logical_or, np.logical_and don't have any special handling for NAs
-#     (Mark's code implements this only for np.any/np.all.)
-# Known limitations of Mark's code that *aren't* limitations of this code:
-#   - where= and masks work together ufunc.__call__
+#     (The code in master implements this only for np.any/np.all.)
+# Known NON-limitations - things that work with this code, but do not work
+# with the code in master:
+#   - where= and masks are allowed together in ufunc.__call__
 #   - ufunc.reduce supports where= (including with masks)
 #   - tolist() returns NAs in appropriate places, instead of stripping off the
 #     mask
-#   - bool(np.array(np.NA)) is an error, just like bool(np.NA). (In Mark's
-#     code, only the latter is an error.
-# Other discrepancies between this and Mark's code:
+#   - bool(np.array(np.NA)) is an error, just like bool(np.NA). (In the code
+#     in master, the former returns True, while the latter is an error.)
+# Other discrepancies between this and the code in master:
 #   - There's something funny going on with memory order and concatenate.
 #     test_array_maskna_concatenate checks a memory order invariant that I'm
-#     seeing fail even for plain old ndarray's.
+#     seeing fail even for plain old ndarray's. Sometimes. I don't understand
+#     this.
 #   - repr has different whitespace. Oh noes.
 #   - I think the original test_array_maskna_setasflat is wrong! If the code
 #     in master is passing it then I think that is bad.
+#   - Calling diagonal() in this code only produces a view if the
+#     underlying np.diagonal function also produces a view. (This has nothing
+#     to do with NAs, but it is tested by test_maskna.py.)
+
+# General strategy:
+#   This module fakes up the numpy interface. Therefore, there are many
+#   confusingly similar function names. In general, you need to pay attention
+#   to the "np" prefix.
+#     np.array(...) <- always refers to the *real* np.array function, returns
+#                      an ndarray
+#     array(...) <- refers to our NEP-world array function, returns a NEPArray
 
 if "_first_time" not in globals():
     _first_time = True
@@ -656,12 +668,6 @@ class NEPArray(np.ndarray):
                     out[idx] = self[idx]
         return out
 
-    # XX not supported (by either this hack or Mark's code in master):
-    #   argmax, argmin, argsort, sort, searchsorted
-    # XX not supported by this hack, status in Mark's code unchecked:
-    #   compress
-    #   put
-
     def view(self, dtype=None, type=None, maskna=None, ownmaskna=False):
         # This thing's calling conventions are totally annoying to emulate
         if isinstance(dtype, __builtins__["type"]) and issubclass(dtype, np.ndarray):
@@ -815,7 +821,7 @@ class NEPArray(np.ndarray):
     def diagonal(self, *args, **kwargs):
         arr = np.ndarray.diagonal(self, *args, **kwargs)
         if self._valid is not None:
-            arr._add_valid(self._valid.diagonal(*args, **kwargs))
+            arr._add_valid(self._valid.diagonal(*args, **kwargs), own=False)
         return arr
 
     def dot(self, *args, **kwargs):
@@ -1088,7 +1094,7 @@ def count_nonzero(a, *args, **kwargs):
     return sum(a != 0, dtype=int, *args, **kwargs)
 
 def count_reduce_items(arr, axis=None, skipna=False, keepdims=False):
-    # XX this has confusing semantics. AFAICT, they are:
+    # This has confusing semantics. AFAICT, they are:
     # - we unconditionally return a scalar, unless:
     #   - skipna=True, and
     #   - the given array has a mask
