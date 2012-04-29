@@ -1,5 +1,68 @@
-import numpy as np
-from numpy import *
+# New features implemented (above and beyond NEP-style masked NA support)
+#   - general interface for overriding ufunc implementation
+#   - where= (including for reduce)
+#   - ufunc.reduce(..., axis=(i, j, ...))
+#   - squeeze(axis=...)
+#   - np.copyto
+#   - ufunc.reduce works on scalars (e.g. logical_or.reduce(True))
+# Missing functions:
+#   - compress
+#   - extract
+#   - put
+#   - einsum
+#   - correlate
+#   - probably others I missed, caveat emptor
+# Known limitations:
+#   - The numpy scalar types (e.g. np.float64) define their own infix
+#     operators (e.g. __mul__), which may dispatch to ufuncs and can't be
+#     overridden. Therefore np.float64(1) * np.array([1, np.NA]) uses the
+#     built-in ufunc and drops the NA value. The only way to avoid this is to
+#     make NEPArray stop inheriting from ndarray, and delegate instead. Maybe
+#     this is a good idea in any case... (The other way to fix it would be to
+#     implement the ufunc override logic in the core.)
+#   - np.all() and np.any() propagate NAs, they don't have the special (NA |
+#     True) == True logic.
+#   - Haven't implemented payloads or dtypes for the NA object, it's just a
+#     strict singleton like None.
+#   - Haven't implemented casting= and preservena= arguments to copyto
+#   - Haven't implemented the logic to make np.diagonal return a view. (This
+#     has nothing to do with NAs, but it's tested by test_maskna.py).
+# Known limitations that are shared with Mark's code:
+#   - Not implemented: argmin, argmax, argsort, sort, searchsorted
+#   - tofile and tostring ignore the mask
+#   - np.logical_or, np.logical_and don't have any special handling for NAs
+#     (Mark's code implements this only for np.any/np.all.)
+# Known limitations of Mark's code that *aren't* limitations of this code:
+#   - where= and masks work together ufunc.__call__
+#   - ufunc.reduce supports where= (including with masks)
+#   - tolist() returns NAs in appropriate places, instead of stripping off the
+#     mask
+#   - bool(np.array(np.NA)) is an error, just like bool(np.NA). (In Mark's
+#     code, only the latter is an error.
+# Other discrepancies between this and Mark's code:
+#   - There's something funny going on with memory order and concatenate.
+#     test_array_maskna_concatenate checks a memory order invariant that I'm
+#     seeing fail even for plain old ndarray's.
+#   - repr has different whitespace. Oh noes.
+#   - I think the original test_array_maskna_setasflat is wrong! If the code
+#     in master is passing it then I think that is bad.
+
+if "_first_time" not in globals():
+    _first_time = True
+
+if _first_time:
+    import numpy as np
+
+def _basearray(a, dtype=None):
+    # Unlike np.asarray, this does not normalize the order of arrays passed
+    # through it.
+    if (dtype is None
+        or getattr(a, "dtype", None) == dtype):
+        if type(a) is np.ndarray:
+            return a
+        if isinstance(a, np.ndarray):
+            return np.ndarray.view(a, np.ndarray)
+    return np.array(a, copy=False, dtype=dtype)
 
 __all__ = np.__all__
 
@@ -36,8 +99,32 @@ class OverrideableUfunc(object):
 
 # For every ufunc in np, create a wrapped version in our namespace
 for name, obj in np.__dict__.iteritems():
-    if isinstance(obj, ufunc):
+    if isinstance(obj, np.ufunc):
         globals()[name] = OverrideableUfunc(obj)
+
+_special_methods_and_ufuncs = [
+    ("abs", abs),
+    ("add", add),
+    ("and", bitwise_and),
+    ("div", divide),
+    ("eq", equal),
+    ("floordiv", floor_divide),
+    ("ge", greater_equal),
+    ("gt", greater),
+    ("invert", bitwise_not),
+    ("le", less_equal),
+    ("lshift", left_shift),
+    ("lt", less),
+    ("mod", remainder),
+    ("mul", multiply),
+    ("ne", not_equal),
+    ("neg", negative),
+    ("or", bitwise_or),
+    ("pow", power),
+    ("sub", subtract),
+    ("truediv", true_divide),
+    ("xor", bitwise_xor),
+    ]
 
 class NAType(object):
     def __new__(cls):
@@ -49,15 +136,32 @@ class NAType(object):
         return "NA"
 
     # XX we don't bother implementing the actual payload/dtype stuff. This is
-    # enough to let the tests pass, and it's not clear that this stuff serves
-    # any purpose anyway.
+    # enough to let the tests pass, and it's not clear that it serves any
+    # purpose anyway.
     def __call__(self, payload=None, dtype=None):
         return NA
 
     payload = None
 
+    def _arithmetic_op(self, *args, **kwargs):
+        return self
+
+    def _make_arith(name):
+        def _op(self, *args, **kwargs):
+            print self, name
+            return NA
+        return _op
+
+    for special, _ in _special_methods_and_ufuncs:
+        locals()["__%s__" % (special,)] = _make_arith(special)
+        locals()["__r%s__" % (special,)] = _make_arith(special)
+        locals()["__i%s__" % (special,)] = lambda self, other: self
+
     def __nonzero__(self):
         raise ValueError, "truth value of an NA is ambiguous"
+
+    def _ufunc_override_(self, *args, **kwargs):
+        return asarray(self)._ufunc_override_(*args, **kwargs)
 
 NA = NAType()
 
@@ -67,12 +171,58 @@ NA = NAType()
 #      before calling the method
 #   -- numpy's versions of these functions swallow extra arguments, like
 #      skipna
-def _method_delegator(method):
-    return (lambda a, *args, **kwargs:
-                getattr(asanyarray(a), method)(*args, **kwargs))
+# However, some of them have different default arguments than the
+# corresponding method. (E.g. np.sum is the same as add.reduce, but with
+# axis=None instead of axis=0 as default.) So we do default argument lookup
+# based on the original function's signature.
+def _get_real_callargs(func, args, kwargs):
+    """Works out a normalized *args and **kwargs for calling the given
+    function, using the default values it has set. Only required arguments are
+    left in 'args'."""
+    from inspect import getargspec, getcallargs
+    arg_names, varargs_name, keywords_name, defaults = getargspec(func)
+    if defaults is None:
+        defaults = ()
+    call_args = getcallargs(func, *args, **kwargs)
+    required_arg_names = arg_names[:len(arg_names) - len(defaults)]
+    # I don't know why getcallargs() has such a funky return value.
+    required_args = []
+    for required_arg_name in required_arg_names:
+        required_args.append(call_args.pop(required_arg_name))
+    required_args = tuple(required_args)
+    if varargs_name in call_args:
+        required_args += call_args.pop(varargs_name)
+    # call_args now contains only the unrequired arguments, plus perhaps a
+    # dict containing any extra unexpected, named, arguments. Merge those into
+    # the same dict as the rest of the arguments.
+    if keywords_name in call_args:
+        call_args.update(call_args.pop(keywords_name))
+    return required_args, call_args
+def _method_delegator(original, method):
+    def delegate(*args, **kwargs):
+        new_kwargs = {}
+        new_kwarg_names = ["skipna", "keepdims"]
+        if method == "squeeze":
+            new_kwarg_names.append("axis")
+        for new_kwarg_name in new_kwarg_names:
+            if new_kwarg_name in kwargs:
+                new_kwargs[new_kwarg_name] = kwargs.pop(new_kwarg_name)
+        args, kwargs = _get_real_callargs(original, args, kwargs)
+        kwargs.update(new_kwargs)
+        return getattr(asanyarray(args[0]), method)(*args[1:], **kwargs)
+    return delegate
 for name in np.core.fromnumeric.__all__:
-    globals()[name] = _method_delegator(name)
+    globals()[name] = _method_delegator(getattr(np.core.fromnumeric, name),
+                                        name)
 
+
+def _normalize_axes(ndim, axis):
+    assert isinstance(axis, tuple)
+    axis = list(axis)
+    for i, ax in enumerate(axis):
+        if ax < 0:
+            axis[i] += ndim
+    return tuple(axis)
 
 class NEPArrayFlags(object):
     def __init__(self, nep_array):
@@ -115,15 +265,15 @@ class NEPArrayFlags(object):
             self[key.upper()] = value
 
 def _with_valid(data, valid, own=True):
-    array = np.asarray(data).view(type=NEPArray)
+    array = _basearray(data).view(type=NEPArray)
     if valid is not None:
         array._add_valid(valid, own=own)
     return array
 
 def _broadcast_to(arr, target):
-    target = np.asarray(target)
-    arr = np.asarray(arr)
-    broadcast = np.lib.stride_tricks.broadcast_arrays(*[arr, target])
+    target = _basearray(target)
+    arr = _basearray(arr)
+    broadcast = np.broadcast_arrays(*[arr, target])
     if broadcast[1].shape != target.shape:
         raise ValueError, "shape mismatch"
     return broadcast[0]
@@ -138,7 +288,7 @@ class NEPArray(np.ndarray):
 
     @property
     def _debug_data(self):
-        return np.asarray(self)
+        return _basearray(self)
 
     def copy(self, order="C", maskna=None):
         new = np.ndarray.copy(self, order=order)
@@ -165,7 +315,7 @@ class NEPArray(np.ndarray):
 
     def _effective_valid(self):
         if self._valid is None:
-            true = np.asarray([True])
+            true = _basearray([True])
             return np.lib.stride_tricks.as_strided(true,
                                                    self.shape,
                                                    (0,) * self.ndim)
@@ -175,20 +325,21 @@ class NEPArray(np.ndarray):
     def _add_valid(self, valid=None, own=True):
         if valid is None:
             valid = np.ones(self.shape, dtype=bool)
-        valid = np.asarray(valid)
+        valid = _basearray(valid)
         assert self.shape == valid.shape
         assert valid.dtype == np.dtype(bool)
-        data_steps = np.asarray(self.strides) // self.dtype.itemsize
+        data_steps = _basearray(self.strides) // self.dtype.itemsize
         wanted_strides = tuple(valid.itemsize * data_steps)
         # mask has different ordering from data, they could get out-of-sync
         # when reshaping, so recreate the mask with the same ordering.
         if wanted_strides != valid.strides:
             print "rearranging mask: strides %r -> %r" % (valid.strides, wanted_strides)
-            new_valid = np.empty(self.size, dtype=bool)
+            new_valid = _basearray(np.empty(self.size, dtype=bool))
             new_valid = np.lib.stride_tricks.as_strided(new_valid,
                                                         shape=self.shape,
                                                         strides=wanted_strides)
             new_valid[...] = valid[...]
+            valid = new_valid
             own = True
         self._valid = valid
         self._ownmaskna = own
@@ -197,18 +348,24 @@ class NEPArray(np.ndarray):
     def _ufunc_override_(self, uf, method, i, args, kwargs):
         skipna = kwargs.pop("skipna", False)
         out = kwargs.pop("out", None)
+        out_given = (out is not None)
         if "dtype" in kwargs and kwargs["dtype"] is None:
             del kwargs["dtype"]
-        if method == "reduceat":
-            arr_args = args[0]
-            other_args = args[1:]
-        else:
-            arr_args = args
-            other_args = ()
-        valids = [asarray(arr_arg)._effective_valid() for arr_arg in arr_args]
+        n_arr_args = {
+            "reduce": 1,
+            "reduceat": 1,
+            "accumulate": 1,
+            "outer": 2,
+            "__call__": uf.nin,
+            }
+        arr_args = args[:n_arr_args[method]]
+        arr_args = [asarray(arr_arg) for arr_arg in arr_args]
+        other_args = args[n_arr_args[method]:]
+        valids = np.broadcast_arrays(*[asarray(arr_arg)._effective_valid()
+                                       for arr_arg in arr_args])
         all_valid = valids[0]
         for valid in valids[1:]:
-            all_valid &= valid
+            all_valid = all_valid & valid
         where = asarray(kwargs.pop("where", True))
 
         # Sanity check the where= argument
@@ -232,32 +389,55 @@ class NEPArray(np.ndarray):
             return type(value)
 
         if method == "__call__":
-            arr_args = np.lib.stride_tricks.broadcast_arrays(*arr_args)
+            maskna = (not skipna
+                      and np.any([arr_arg.flags.maskna for arr_arg in arr_args]))
+            arr_args = np.broadcast_arrays(*arr_args)
             where = _broadcast_to(where, arr_args[0])
-            if skipna:
-                # Can't use &= b/c broadcasting leaves us with funny strides:
-                where = where & all_valid 
-            out_data = uf(*[arr[where] for arr in arr_args], **kwargs)
+            # Can't use &= b/c broadcasting leaves us with funny strides:
+            where_and_valid = _basearray(where & all_valid)
+            use_args = tuple([arr[where_and_valid] for arr in arr_args]) + other_args
+            out_data = uf(*use_args, **kwargs)
             if out is None:
-                out = empty(arr_args[0].shape, dtype=dtype_from(out_data))
-            out[where] = out_data
-            out[where] = all_valid[where]
-            return out
+                out = empty(arr_args[0].shape, dtype=dtype_from(out_data),
+                            maskna=maskna)
+            if out.ndim == 0:
+                if where:
+                    if all_valid:
+                        out.itemset(out_data)
+                    else:
+                        if out._valid is None:
+                            raise ValueError, "can't write NA to out= array"
+                        out._valid.itemset(False)
+            else:
+                _basearray(out)[where_and_valid] = out_data
+                if out._valid is not None:
+                    if skipna:
+                        out._valid[where_and_valid] = all_valid[where_and_valid]
+                    else:
+                        out._valid[where] = all_valid[where]
+                else:
+                    if not np.all(all_valid[where]):
+                        raise ValueError, "can't write NA to out= array"
+            if not out_given and out.ndim == 0:
+                return out[()]
+            else:
+                return out
         elif method == "reduce":
             assert len(arr_args) == 1
             arr = arr_args[0]
+            for i, argname in enumerate(["axis", "dtype", "out"]):
+                if len(other_args) > i:
+                    kwargs[argname] = other_args[i]
             where = _broadcast_to(where, arr)
             if skipna:
                 where = where & all_valid
             axis = kwargs.pop("axis", 0)
             keepdims = kwargs.pop("keepdims", False)
             if axis is None:
-                axis = 0
-                arr = arr.flatten()
-                all_valid = all_valid.flatten()
-                where = where.flatten()
+                axis = tuple(range(arr.ndim))
             if isinstance(axis, int):
                 axis = (axis,)
+            axis = _normalize_axes(arr.ndim, axis)
             assert isinstance(axis, tuple)
             out_shape = tuple([size for (i, size) in enumerate(arr.shape)
                                if i not in axis])
@@ -271,38 +451,50 @@ class NEPArray(np.ndarray):
             if out is not None:
                 final_out_shape = out.shape
                 out.resize(out_shape)
+            # reductions always have the same output and input dtypes
+            dtype = kwargs.get("dtype", arr.dtype)
             if out is None:
-                dtype_check = uf.reduce(np.asarray(arr)[:2, ...])
-                out = empty(out_shape, dtype=dtype_from(dtype_check),
+                out = empty(out_shape, dtype=dtype,
                             maskna=(arr._valid is not None and not skipna))
             for i in xrange(np.prod(out_shape, dtype=int)):
                 if out_shape:
                     out_idx = np.unravel_index(i, out_shape)
                     in_idx = list(out_idx)
                     for i in sorted(axis):
-                        in_idx.insert(i, slice(0))
+                        in_idx.insert(i, slice(None))
                     in_idx = tuple(in_idx)
                 else:
                     out_idx = None
                     in_idx = None
                 if not np.any(where[in_idx]):
-                    continue
-                if skipna:
-                    valid = True
+                    if uf.identity is None:
+                        raise ValueError, "zero-size reduction with no identity"
+                    value = uf.identity
                 else:
-                    valid = np.logical_and.reduce(arr._effective_valid()[in_idx][where[in_idx]])
-                if valid:
-                    value = uf.reduce(np.asarray(arr)[in_idx][where[in_idx]],
-                                      **kwargs)
-                else:
-                    value = NA
+                    if skipna:
+                        valid = True
+                    else:
+                        valid = np.logical_and.reduce(arr._effective_valid()[in_idx][where[in_idx]])
+                    if valid:
+                        reduce_data = _basearray(arr)[in_idx]
+                        if reduce_data.ndim == 0:
+                            # We know that 'where' is True from the check above
+                            value = reduce_data
+                        else:
+                            value = uf.reduce(reduce_data[where[in_idx]],
+                                              **kwargs)
+                    else:
+                        value = NA
                 if value is NA and out._valid is None:
                     raise ValueError, "can't store NA in out array with maskna=False"
                 out[out_idx] = value
             out.resize(final_out_shape)
-            return out
+            if not out_given and out.ndim == 0:
+                return out[()]
+            else:
+                return out
         elif method in ("accumulate", "outer", "reduceat"):
-            # XX wouldn't be too hard to add these. They aren't supported by
+            # XX wouldn't be too hard to add these. The aren't supported by
             # Mark's code in master either.
             for arr in arr_args:
                 if not np.all(arr._effective_valid()):
@@ -311,7 +503,7 @@ class NEPArray(np.ndarray):
                 raise ValueError, "where= not yet supported for ufunc.%s" % (method,)
             if out is not None:
                 kwargs["out"] = out
-            base_arr_args = tuple([np.asarray(arr) for arr in arr_args])
+            base_arr_args = tuple([_basearray(arr) for arr in arr_args])
             return asarray(getattr(uf, method)(*(base_arr_args + other_args),
                                                **kwargs))
 
@@ -326,8 +518,8 @@ class NEPArray(np.ndarray):
     shape = property(np.ndarray.shape.__get__, _set_shape)
 
     def _set_strides(self, strides):
-        assert np.all(np.asarray(strides) % self.dtype.itemsize == 0)
-        valid_strides = tuple(np.asarray(strides) // self.dtype.itemsize
+        assert np.all(_basearray(strides) % self.dtype.itemsize == 0)
+        valid_strides = tuple(_basearray(strides) // self.dtype.itemsize
                               * np.dtype(bool).itemsize)
         np.ndarray.strides.__set__(self, strides)
         if self._valid is not None:
@@ -340,26 +532,37 @@ class NEPArray(np.ndarray):
             self._valid = self._valid.reshape(*args, **kwargs)
 
     def reshape(self, *args, **kwargs):
+        # This may or may not make a copy, depending on order=
+        reshaped = np.ndarray.reshape(self, *args, **kwargs)
+        valid = None
+        if self._valid is not None:
+            valid = self._valid.reshape(*args, **kwargs)
+        return _with_valid(reshaped, valid, own=False)
+
+    def squeeze(self, axis=None):
+        if axis is None:
+            axis = tuple([i for (i, l) in enumerate(self.shape) if l == 1])
+        if not isinstance(axis, tuple):
+            axis = (axis,)
+        axis = _normalize_axes(self.ndim, axis)
+        for i in axis:
+            if self.shape[i] != 1:
+                raise ValueError, "can't squeeze non-unitary dimension"
+        mask = np.ones(self.ndim, dtype=bool)
+        mask[_basearray(axis)] = False
         new = self.view()
-        new.resize(*args, **kwargs)
+        new.shape = tuple(_basearray(self.shape)[mask])
         return new
 
-    def squeeze(self, *args, **kwargs):
-        squeezed = np.asarray(self).squeeze(*args, **kwargs)
-        squeezed_valid = None
-        if self._valid is not None:
-            squeezed_valid = self._valid.squeeze(*args, **kwargs)
-        return _with_valid(squeezed, squeezed_valid, own=False)
-
     def swapaxes(self, axis1, axis2):
-        swapped = np.asarray(self).swapaxes(axis1, axis2)
+        swapped = np.ndarray.swapaxes(self, axis1, axis2)
         swapped_valid = None
         if self._valid is not None:
             swapped_valid = self._valid.swapaxes(axis1, axis2)
         return _with_valid(swapped, swapped_valid, own=False)
 
     def transpose(self, *axes):
-        transposed = np.asarray(self).transpose(*axes)
+        transposed = _basearray(self).transpose(*axes)
         transposed_valid = None
         if self._valid is not None:
             transposed_valid = self._valid.transpose(*axes)
@@ -368,15 +571,16 @@ class NEPArray(np.ndarray):
     def ravel(self, order="C"):
         if self._valid is None:
             # This supports all the orderings
-            return asarray(np.asarray(self).ravel(order=order))
+            return asarray(_basearray(self).ravel(order=order))
         else:
-            # XX
-            assert order in ("C", "F")
-            if ((order == "C" and self.flags.c_contiguous)
-                or (order == "F" and self.flags.f_contiguous)):
-                return _with_valid(np.ndarray.ravel(self).ravel(order=order),
-                                   self._valid.ravel(), own=False)
-            return self.flatten(order=order)
+            if ((order in ("C", "A") and self.flags.c_contiguous)
+                or (order in ("F", "A") and self.flags.f_contiguous)
+                or order == "K"):
+                own = False
+            else:
+                own = True
+            return _with_valid(np.ndarray.ravel(self, order=order),
+                               self._valid.ravel(order=order), own=own)
 
     @property
     def T(self):
@@ -389,19 +593,38 @@ class NEPArray(np.ndarray):
             valid = self._valid.repeat(self, *args, **kwargs)
         return _with_valid(new, valid)
 
-    def mean(self, *args, **kwargs):
-        numerators = sum(self, *args, **kwargs)
-        kwargs.pop("out", None)
-        denominators = sum(self._effective_valid(), *args, **kwargs)
+    def mean(self, axis=None, dtype=None, out=None, skipna=False, keepdims=False):
+        if dtype is None and np.issubdtype(self.dtype, np.integer):
+            dtype = float
+        numerators = asarray(sum(self, axis=axis, dtype=dtype, skipna=skipna,
+                                 keepdims=keepdims, out=out))
+        denominators = count_reduce_items(self, axis=axis,
+                                          skipna=skipna, keepdims=keepdims)
         numerators /= denominators
-        return numerators
+        if numerators.ndim == 0 and out is None:
+            return numerators[()]
+        else:
+            return numerators
 
     def std(self, *args, **kwargs):
         return sqrt(self.var(*args, **kwargs))
 
     def var(self, axis=None, dtype=None, out=None, ddof=0, skipna=False,
             keepdims=False):
-        raise NotImplementedError
+        N = count_reduce_items(self, axis=axis, skipna=skipna, keepdims=keepdims)
+        # asarray() is to work around a bug -- otherwise, N may have type
+        # np.float64, which defines its own __mul__ operator, which means that
+        # 'scale * SX' will call the true np.multiply instead of our
+        # overridden version.
+        scale = asarray(1. / (N - ddof))
+        SX = sum(self, axis=axis, skipna=skipna, keepdims=keepdims)
+        SX2 = sum(self ** 2, axis=axis, skipna=skipna, keepdims=keepdims)
+        result = scale * SX2 - (scale * SX) ** 2
+        if out:
+            out[...] = result
+            return out
+        else:
+            return result
         
     def __contains__(self, other):
         if other is NA:
@@ -414,14 +637,30 @@ class NEPArray(np.ndarray):
         valid = np.ndarray.choose(self, [c._effective_valid() for c in choices])
         return _with_valid(data, valid)
 
-    # clip is fine as-is
+    def clip(self, a_min, a_max, out=None):
+        if out is None:
+            out = empty(self.shape, dtype=self.dtype, maskna=self.flags.maskna)
+        for i in xrange(np.prod(self.shape)):
+            if self.shape == ():
+                idx = ()
+            else:
+                idx = np.unravel_index(i, self.shape)
+            if not self._effective_valid()[idx]:
+                out[idx] = NA
+            else:
+                if a_min is not None and self[idx] < a_min:
+                    out[idx] = a_min
+                elif a_max is not None and self[idx] > a_max:
+                    out[idx] = a_max
+                else:
+                    out[idx] = self[idx]
+        return out
 
     # XX not supported (by either this hack or Mark's code in master):
     #   argmax, argmin, argsort, sort, searchsorted
     # XX not supported by this hack, status in Mark's code unchecked:
     #   compress
-    #   put, take
-    #   tofile, tolist
+    #   put
 
     def view(self, dtype=None, type=None, maskna=None, ownmaskna=False):
         # This thing's calling conventions are totally annoying to emulate
@@ -440,7 +679,7 @@ class NEPArray(np.ndarray):
             and self._valid is not None):
             raise TypeError, "can't view masked array using mismatched itemsize"
         arr = np.ndarray.view(self, **kwargs)
-        assert isinstance(arr, NEPArray)
+        #assert isinstance(arr, NEPArray)
         if ownmaskna:
             maskna = True
         if self._valid is not None:
@@ -448,7 +687,7 @@ class NEPArray(np.ndarray):
                 if ownmaskna:
                     arr._add_valid(self._valid.copy())
                 else:
-                    arr._add_valid(self._valid, own=False)
+                    arr._add_valid(self._valid.view(), own=False)
             else:
                 raise ValueError, "can't remove mask"
         else:
@@ -457,15 +696,30 @@ class NEPArray(np.ndarray):
         return arr
 
     def astype(self, dtype, *args, **kwargs):
-        kwargs["subok"] = True
         # We don't want to call astype on masked out elements -- if they are
         # not convertible then that's okay.
         out = empty(self.shape, dtype=dtype, maskna=self.flags.maskna)
         valid = self._effective_valid()
-        out[valid] = np.asarray(self)[valid].astype(dtype, *args, **kwargs)
+        out[valid] = _basearray(self)[valid].astype(dtype, *args, **kwargs)
         return out
 
+    def _check_index(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        for piece in key:
+            if isinstance(piece, (int, long, slice,
+                                  type(Ellipsis), type(None))):
+                # simple indexing, no problem
+                continue
+            else:
+                piece = asarray(piece)
+                # We should perhaps allow integer indexing by NA (returning an
+                # NA). But we don't yet.
+                if not np.all(piece._effective_valid()):
+                    raise ValueError, "Can't index by NA"
+
     def __getitem__(self, key):
+        self._check_index(key)
         data = np.ndarray.__getitem__(self, key)
         if ((isinstance(key, int) and self.ndim == 1)
             or (isinstance(key, tuple)
@@ -490,21 +744,42 @@ class NEPArray(np.ndarray):
                 own = False
         return _with_valid(data, valid, own=own)
 
+    def take(self, indices, axis=None, out=None, mode="raise"):
+        data = np.ndarray.take(self, indices, axis=axis, mode=mode)
+        if self._valid is not None:
+            valid = np.ndarray.take(self._effective_valid(), indices,
+                                    axis=axis, mode=mode)
+        result = _with_valid(data, valid)
+        if out is None:
+            return result
+        else:
+            out[...] = result
+            return out
+
     def __setitem__(self, key, value):
+        self._check_index(key)
         value = asarray(value)
         if self._valid is None:
             if np.any(~value._effective_valid()):
                 raise ValueError, "cannot assign NA to array with maskna=False"
-            np.ndarray.__setitem__(self, key, np.asarray(value))
+            np.ndarray.__setitem__(self, key, _basearray(value))
         else:
-            valid = _broadcast_to(value._effective_valid(), np.asarray(self)[key])
+            valid = _broadcast_to(value._effective_valid(),
+                                  _basearray(self)[key])
             if valid.size == 1:
-                if valid:
-                    np.asarray(self)[key] = np.asarray(value)
+                if value._effective_valid():
+                    _basearray(self)[key] = _basearray(value)
             else:
-                np.asarray(self)[key][valid] = (
-                    np.asarray(value)[value._effective_valid()])
+                if np.any(value._effective_valid()):
+                    bool_valid_key = np.zeros(self.shape, dtype=bool)
+                    bool_valid_key[key] = valid
+                    _basearray(self)[bool_valid_key] = (
+                        _basearray(value)[value._effective_valid()])
             self._valid[key] = value._effective_valid()
+
+    def setasflat(self, arr):
+        arr = asarray(arr).ravel(order="K")
+        self.ravel(order="K")[:] = arr[:]
 
     def __getslice__(self, i, j):
         return self.__getitem__(slice(i, j))
@@ -513,7 +788,7 @@ class NEPArray(np.ndarray):
         self.__setitem__(slice(i, j), value)
 
     def _objarray_with_NAs(self):
-        object_array = np.asarray(self, dtype=object)
+        object_array = _basearray(self, dtype=object)
         if object_array.ndim > 0:
             object_array[~self._effective_valid()] = NA
         else:
@@ -535,10 +810,12 @@ class NEPArray(np.ndarray):
         return repr(self._objarray_with_NAs()).replace(", dtype=object",
                                                        extra)
 
-    def diagonal(self):
-        arr = np.ndarray.diagonal(self)
+    __str__ = __repr__
+
+    def diagonal(self, *args, **kwargs):
+        arr = np.ndarray.diagonal(self, *args, **kwargs)
         if self._valid is not None:
-            arr._add_valid(self._valid.diagonal())
+            arr._add_valid(self._valid.diagonal(*args, **kwargs))
         return arr
 
     def dot(self, *args, **kwargs):
@@ -579,12 +856,18 @@ class NEPArray(np.ndarray):
 
     def itemset(self, *args):
         if args[-1] is NA:
+            if self._valid is None:
+                raise ValueError, "can't assign NA to array with namask=False"
             self._valid.itemset(*(args[:-1] + (False,)))
         else:
-            self._valid.itemset(*(args[:-1] + (True,)))
+            if self._valid is not None:
+                self._valid.itemset(*(args[:-1] + (True,)))
             np.ndarray.itemset(self, *args)
 
-    # XX: what the heck should nonzero() do with an NA?
+    def nonzero(self):
+        if not np.all(self._effective_valid()):
+            raise ValueError, "nonzero() undefined on array with NAs"
+        return np.ndarray.nonzero(self)
 
     # The rest is just noise needed to make sure ufunc-like methods dispatch
     # via OverrideableUfunc instead of going straight to the real numpy
@@ -615,51 +898,43 @@ class NEPArray(np.ndarray):
     def _make_inplace_func_delegator(func):
         return lambda self, other: func(self, other, out=self)
 
-    for (method, func) in [("sum", add.reduce),
-                           ("all", logical_and.reduce),
-                           ("any", logical_or.reduce),
-                           ("max", maximum.reduce),
-                           ("min", minimum.reduce),
-                           ("conj", conjugate),
-                           ("conjugate", conjugate),
-                           ("cumprod", multiply.accumulate),
-                           ("cumsum", add.accumulate),
-                           ("prod", multiply.reduce),
-                           ]:
-        locals()[method] = _make_func_delegator(func)
-
-    for (special, func) in [("abs", abs),
-                            ("add", add),
-                            ("and", bitwise_and),
-                            ("div", divide),
-                            ("eq", equal),
-                            ("floordiv", floor_divide),
-                            ("ge", greater_equal),
-                            ("gt", greater),
-                            ("invert", bitwise_not),
-                            ("le", less_equal),
-                            ("lshift", left_shift),
-                            ("lt", less),
-                            ("mod", remainder),
-                            ("mul", multiply),
-                            ("ne", not_equal),
-                            ("neg", negative),
-                            ("or", bitwise_or),
-                            ("pow", pow),
-                            ("sub", subtract),
-                            ("truediv", true_divide),
-                            ("xor", bitwise_xor),
-                            ]:
+    for (special, func) in _special_methods_and_ufuncs:
         locals()["__%s__" % (special,)] = _make_func_delegator(func)
-        # There is no such thing as e.g. "__rabs__", but defining it doesn't
-        # do any harm either:
+        # Not all of these are meaningful (e.g. __rabs__) but defining them
+        # won't do any harm either:
         locals()["__r%s__" % (special,)] = _make_reverse_func_delegator(func)
-        # Likewise for in-place operations:
         locals()["__i%s__" % (special,)] = _make_inplace_func_delegator(func)
+
+    conjugate = conj = _make_func_delegator(conjugate)
 
     del _make_func_delegator
     del _make_reverse_func_delegator
     del _make_inplace_func_delegator
+
+    def _make_reduction_method_replacement(replacement, takes_dtype):
+        if takes_dtype:
+            def wrapper_method(self, axis=None, dtype=None, out=None,
+                               skipna=False, keepdims=False):
+                return replacement(self, axis=axis, dtype=dtype, out=out,
+                                   skipna=skipna, keepdims=keepdims)
+        else:
+            def wrapper_method(self, axis=None, out=None, skipna=False,
+                               keepdims=False):
+                return replacement(self, axis=axis, out=out, skipna=skipna,
+                                   keepdims=keepdims)
+        return wrapper_method
+    for (method, func, takes_dtype) in [("sum", add.reduce, True),
+                                        ("all", logical_and.reduce, False),
+                                        ("any", logical_or.reduce, False),
+                                        ("max", maximum.reduce, False),
+                                        ("min", minimum.reduce, False),
+                                        ("amax", maximum.reduce, False),
+                                        ("amin", minimum.reduce, False),
+                                        ("cumprod", multiply.accumulate, True),
+                                        ("cumsum", add.accumulate, True),
+                                        ("prod", multiply.reduce, True),
+                                        ]:
+        locals()[method] = _make_reduction_method_replacement(func, takes_dtype)
 
 ndarray = NEPArray
 
@@ -679,31 +954,40 @@ def dot(a, b, out=None):
 
 def array(array_like, dtype=None, copy=True, order=None, subok=False,
           ndmin=0, maskna=None, ownmaskna=False):
-    a = np.array(array_like, dtype=dtype, copy=copy, order=order, subok=True,
+    # First, convert without a dtype= argument, to let the auto-detection work
+    a = np.array(array_like, copy=copy, order=order, subok=True,
                  ndmin=ndmin)
     # This handles cases like array([1, 2, NA]), where we need to both do
     # dtype detection and extract the NAs to create a mask.
+    NA_mask = np.zeros(a.shape, dtype=bool)
+    a_ravel = a.ravel()
+    a_ids = _basearray(map(id, a_ravel.tolist()))
+    NA_mask[...] = (a_ids == id(NA)).reshape(NA_mask.shape)
     if (not isinstance(array_like, np.ndarray)
         and a.dtype == np.dtype(object)
-        and NA in np.asarray(a)):
+        and np.any(NA_mask)):
         if maskna == False:
             raise ValueError, "found NA with maskna=False"
-        data = np.asarray(a)
-        if data.ndim == 0:
+        if a.ndim == 0:
             return _with_valid(np.array(0.0), np.array(False))
-        valid = (data != NA)
-        non_NAs = data[valid]
+        valid = ~NA_mask
+        non_NAs = a[valid]
         if non_NAs.size == 0:
             # array([NA]) gives a float array, just like array([])
             non_NA = 0.0
         else:
             non_NA = non_NAs[0]
-        data[data == NA] = non_NA
-        a = np.array(data.tolist())
+        a[NA_mask] = non_NA
+        a = np.array(a.tolist(), dtype=dtype, order=order, ndmin=ndmin)
         return _with_valid(a, valid)
     # If we get here, we actually have either a NEPArray or something that was
-    # converted into a plain old array without any NAs in it
-    if not isinstance(a, NEPArray):
+    # converted into a plain old array without any NAs in it. But, we might
+    # have been requested to change the dtype and not done so.
+    if dtype is not None and dtype != a.dtype:
+        a = np.array(array_like, dtype=dtype, copy=copy, order=order, subok=True,
+                     ndmin=ndmin)
+    if (not isinstance(a, NEPArray)
+        or (not subok and type(a) != NEPArray)):
         a = a.view(type=NEPArray)
     # Okay, now we have a NEPArray; just have to implement the maskna flags.
     if copy and maskna:
@@ -719,36 +1003,29 @@ def array(array_like, dtype=None, copy=True, order=None, subok=False,
             # np.array passed the input through unchanged, so we need to check
             # it and possibly copy it
             if maskna and not a.flags.maskna:
-                a = a.copy()
+                a = a.view()
                 a._add_valid()
             if ownmaskna and not a.flags.ownmaskna:
-                a = a.copy()
+                a = _with_valid(_basearray(a), a._effective_valid().copy())
                 assert a.flags.ownmaskna
         else:
             # np.array did not pass through the input; therefore the mask was
-            # lost. Recover it.
+            # lost. Recover it. (.reshape() in case ndmin= was used to change
+            # the array's shape.)
             if ownmaskna:
-                a._add_valid(array_like._valid.copy())
+                a._add_valid(array_like._valid.copy().reshape(a.shape))
             else:
-                a._add_valid(array_like._valid, own=False)
+                a._add_valid(array_like._valid.reshape(a.shape), own=False)
     if maskna == True and a._valid is None:
         a._add_valid()
     if maskna == False and a._valid is not None:
         if np.all(a._valid):
-            return _with_valid(np.asarray(a), None)
+            return _with_valid(_basearray(a), None)
         else:
             raise ValueError, "found NA with maskna=False"
     assert not maskna or a.flags.maskna
     assert not ownmaskna or a.flags.ownmaskna
     return a
-
-def asarray(*args, **kwargs):
-    kwargs.setdefault("copy", False)
-    return array(*args, **kwargs)
-
-def asanyarray(*args, **kwargs):
-    kwargs.setdefault("subok", True)
-    return asarray(*args, **kwargs)
 
 def _wrap_array_builder(func):
     def builder(*args, **kwargs):
@@ -758,13 +1035,27 @@ def _wrap_array_builder(func):
                        ownmaskna=ownmaskna)
     return builder
 
-for func_name in ["arange", "zeros", "ones", "zeros_like", "ones_like"]:
-    globals()[func_name] = _wrap_array_builder(globals()[func_name])
+# This is only re-defined so that it will accept and pass on the new arguments
+# like maskna.
+def asarray(*args, **kwargs):
+    kwargs.setdefault("copy", False)
+    return array(*args, **kwargs)
+
+# This is only re-defined so that it will accept and pass on the new arguments
+# like maskna.
+def asanyarray(*args, **kwargs):
+    kwargs.setdefault("subok", True)
+    return asarray(*args, **kwargs)
+
+for func_name in ["arange", "zeros", "ones", "zeros_like", "ones_like",
+                  "linspace", "logspace", "eye", "identity"]:
+    globals()[func_name] = _wrap_array_builder(getattr(np, func_name))
 
 def empty(*args, **kwargs):
     maskna = kwargs.pop("maskna", None)
-    arr = asarray(np.empty(*args, **kwargs), maskna=maskna)
+    arr = np.empty(*args, **kwargs).view(NEPArray)
     if maskna:
+        arr._add_valid()
         arr._valid.fill(False)
     return arr
 
@@ -775,8 +1066,109 @@ def empty_like(*args, **kwargs):
         arr._valid.fill(False)
     return arr
 
-max = maximum.reduce
-min = minimum.reduce
+max = amax
+min = amin
+
 def copy(*args, **kwargs):
     kwargs["copy"] = True
     return array(*args, **kwargs)
+
+def concatenate(array_likes, axis=0):
+    print array_likes, axis
+    arrays = [asarray(array_like) for array_like in array_likes]
+    data = np.concatenate(arrays, axis=axis)
+    print "data.strides =", data.strides
+    valid = None
+    if np.any([arr._valid is not None for arr in arrays]):
+        valid = np.concatenate([arr._effective_valid() for arr in arrays],
+                               axis=axis)
+    return _with_valid(data, valid)
+
+def count_nonzero(a, *args, **kwargs):
+    return sum(a != 0, dtype=int, *args, **kwargs)
+
+def count_reduce_items(arr, axis=None, skipna=False, keepdims=False):
+    # XX this has confusing semantics. AFAICT, they are:
+    # - we unconditionally return a scalar, unless:
+    #   - skipna=True, and
+    #   - the given array has a mask
+    if skipna and arr._valid is not None:
+        count_arr = _basearray(arr._effective_valid(), dtype=int)
+    else:
+        count_arr = np.ones(arr.shape, dtype=int)
+    result = sum(count_arr, axis=axis, keepdims=keepdims)
+    if not skipna or arr._valid is None and isinstance(result, np.ndarray):
+        return result.ravel()[0]
+    return result
+
+def broadcast_arrays(*args):
+    args = [asarray(arg) for arg in args]
+    bc_datas = np.broadcast_arrays(*args)
+    bc_neparrays = []
+    for i, bc_data in enumerate(bc_datas):
+        valid = None
+        if args[i]._valid is not None:
+            valid = _broadcast_to(args[i]._valid, bc_data)
+        bc_neparrays.append(_with_valid(bc_data, valid, own=False))
+    return bc_neparrays
+
+# XX This elides the casting= and preservena= arguments from Mark's
+# implementation.
+def copyto(dst, src, where=None):
+    if where is None:
+        dst[...] = src[...]
+    else:
+        orig_dst_shape = dst.shape
+        dst, src, where = broadcast_arrays(dst, src, where)
+        if orig_dst_shape != dst.shape:
+            raise ValueError, "shape mismatch"
+        dst[where] = src[where]
+
+def my_assert_array_equal(x, y, *args, **kwargs):
+    x = asarray(x)
+    y = asarray(y)
+    from numpy.testing import assert_array_equal
+    assert_array_equal(x._effective_valid(), y._effective_valid(),
+                       *args, **kwargs)
+    assert_array_equal(_basearray(x)[x._effective_valid()],
+                       _basearray(y)[y._effective_valid()],
+                       *args, **kwargs)
+
+def _monkeypatch_multiarray(exported_multiarray_functions):
+    # First, replace the core C functions exported by numpy.core.multiarray
+    # with our own versions:
+    for funcname in exported_multiarray_functions:
+        if (funcname in globals()
+            and isinstance(getattr(np, funcname), type(np.array))):
+            setattr(np.core.multiarray, funcname, globals()[funcname])
+    # Then, delete the current references to all the modules that import from
+    # numpy.core.multiarray, and re-import them. This leaves *us* with access
+    # to the original functions executing in their original namespaces, while
+    # everyone else will get new versions executing in new namespaces that
+    # have the new multiarray functions imported.
+    import sys
+    modules = []
+    for modname, module in sys.modules.iteritems():
+        if (type(module) == type(sys)
+            and (modname == "numpy" or modname.startswith("numpy."))
+            and modname != "numpy.core.multiarray"):
+            modules.append(modname)
+    for modname in modules:
+        del sys.modules[modname]
+    import numpy
+            
+if _first_time:
+    _exported_multiarray_functions = []
+    for k, v in np.core.multiarray.__dict__.iteritems():
+        if isinstance(v, type(np.array)) and v is getattr(np, k, None):
+            _exported_multiarray_functions.append(k)
+_monkeypatch_multiarray(_exported_multiarray_functions)
+
+# Import any global constants etc. that we don't override
+import numpy as patched_np
+for name in patched_np.__all__:
+    if name not in globals():
+        globals()[name] = getattr(patched_np, name)
+
+# This will remain False during future reload()s
+_first_time = False
