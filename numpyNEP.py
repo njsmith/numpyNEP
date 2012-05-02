@@ -3,7 +3,9 @@
 # This is tested against numpy 1.6.1.
 #
 # This will certainly be slow. The idea is to see if we can usefully prototype
-# the API to experiment with, so speed isn't really relevant.
+# the API to experiment with, so speed isn't really relevant. If you want to
+# know how fast a real optimized implementation would go, write a
+# microbenchmark :-).
 # 
 # New features implemented (above and beyond NEP-style masked NA support)
 #   - A general interface for overriding ufunc implementation
@@ -82,7 +84,18 @@
 #   np.concatenate, and get np.hstack, np.column_stack, etc., for
 #   free. (However, in *this* file, np.hstack etc. always refer to the
 #   non-monkeypatched versions, thanks to a little namespace magic!)
+#
+# Our new array class is called NEPArray. It has an attribute called "_valid",
+# which is either:
+#   - None, or
+#   - a (base class) np.ndarray, with bool dtype, the same shape as the array
+#     it is attached to, and the same memory ordering.
+# _valid is named as such to remind us that we follow the convention where
+# a True entry in _valid means that the corresponding entry in the data array
+# (self) is valid, and a False entry in _valid indicates an NA.
 
+# A little trick to let us support reload()ing this module, mostly only useful
+# while debugging.
 if "_first_time" not in globals():
     _first_time = True
 
@@ -91,6 +104,9 @@ if _first_time:
 
 __all__ = np.__all__
 
+# This implements a generic API for letting objects intercede in ufunc calls;
+# nothing masked-array specific about it. (There is a also a ton more code
+# down below needed to help it work with things like np.sum.)
 class OverrideableUfunc(object):
     def __init__(self, real_ufunc):
         self._real_ufunc = real_ufunc
@@ -238,6 +254,8 @@ for name in np.core.fromnumeric.__all__:
 
 
 def _normalize_axes(ndim, axis):
+    if isinstance(axis, int):
+        axis = (axis,)
     assert isinstance(axis, tuple)
     axis = list(axis)
     for i, ax in enumerate(axis):
@@ -290,12 +308,16 @@ class NEPArrayFlags(object):
         return (base + "\n  MASKNA : %s\n  OWNMASKNA : %s"
                 % (self.maskna, self.ownmaskna))
 
+# This is the main convenience function we use all over the place for creating
+# a NEPArray out of two np.ndarray's.
 def _with_valid(data, valid, own=True):
     array = np.asarray(data).view(type=NEPArray)
     if valid is not None:
         array._add_valid(valid, own=own)
     return array
 
+# Utility function: uses stride tricks to broadcast 'arr' so it is the same
+# shape as 'target'.
 def _broadcast_to(arr, target):
     target = np.asarray(target)
     arr = np.asarray(arr)
@@ -304,6 +326,7 @@ def _broadcast_to(arr, target):
         raise ValueError, "shape mismatch"
     return broadcast[0]
 
+# Here's the core class:
 class NEPArray(np.ndarray):
     # We always instantiate with no mask.
     # _valid == None -> no mask allocated
@@ -336,9 +359,6 @@ class NEPArray(np.ndarray):
     def flags(self):
         return NEPArrayFlags(self)
 
-    # We don't bother with __array_wrap__ and __array_finalize__ -- instead we
-    # override ufuncs and indexing directly.
-
     def _effective_valid(self):
         if self._valid is None:
             true = np.asarray([True])
@@ -359,7 +379,7 @@ class NEPArray(np.ndarray):
         # mask has different ordering from data, they could get out-of-sync
         # when reshaping, so recreate the mask with the same ordering.
         if wanted_strides != valid.strides:
-            print "rearranging mask: strides %r -> %r" % (valid.strides, wanted_strides)
+            print "DBG: rearranging mask: strides %r -> %r" % (valid.strides, wanted_strides)
             new_valid = np.asarray(np.empty(self.size, dtype=bool))
             new_valid = np.lib.stride_tricks.as_strided(new_valid,
                                                         shape=self.shape,
@@ -461,8 +481,6 @@ class NEPArray(np.ndarray):
             keepdims = kwargs.pop("keepdims", False)
             if axis is None:
                 axis = tuple(range(arr.ndim))
-            if isinstance(axis, int):
-                axis = (axis,)
             axis = _normalize_axes(arr.ndim, axis)
             assert isinstance(axis, tuple)
             out_shape = tuple([size for (i, size) in enumerate(arr.shape)
@@ -581,8 +599,6 @@ class NEPArray(np.ndarray):
     def squeeze(self, axis=None):
         if axis is None:
             axis = tuple([i for (i, l) in enumerate(self.shape) if l == 1])
-        if not isinstance(axis, tuple):
-            axis = (axis,)
         axis = _normalize_axes(self.ndim, axis)
         for i in axis:
             if self.shape[i] != 1:
@@ -1064,14 +1080,6 @@ def array(array_like, dtype=None, copy=True, order=None, subok=False,
     assert not ownmaskna or a.flags.ownmaskna
     return a
 
-def _wrap_array_builder(func):
-    def builder(*args, **kwargs):
-        maskna = kwargs.pop("maskna", None)
-        ownmaskna = kwargs.pop("ownmaskna", False)
-        return asarray(func(*args, **kwargs), maskna=maskna,
-                       ownmaskna=ownmaskna)
-    return builder
-
 # This is only re-defined so that it will accept and pass on the new arguments
 # like maskna.
 def asarray(*args, **kwargs):
@@ -1083,6 +1091,14 @@ def asarray(*args, **kwargs):
 def asanyarray(*args, **kwargs):
     kwargs.setdefault("subok", True)
     return asarray(*args, **kwargs)
+
+def _wrap_array_builder(func):
+    def builder(*args, **kwargs):
+        maskna = kwargs.pop("maskna", None)
+        ownmaskna = kwargs.pop("ownmaskna", False)
+        return asarray(func(*args, **kwargs), maskna=maskna,
+                       ownmaskna=ownmaskna)
+    return builder
 
 for func_name in ["arange", "zeros", "ones", "zeros_like", "ones_like",
                   "linspace", "logspace", "eye", "identity"]:
@@ -1125,7 +1141,7 @@ def count_nonzero(a, *args, **kwargs):
 def count_reduce_items(arr, axis=None, skipna=False, keepdims=False):
     # This has confusing semantics. AFAICT, they are:
     # - we unconditionally return a scalar, unless:
-    #   - skipna=True, and
+    #   - skipna=True, AND
     #   - the given array has a mask
     if skipna and arr._valid is not None:
         count_arr = np.asarray(arr._effective_valid(), dtype=int)
@@ -1159,6 +1175,8 @@ def copyto(dst, src, where=None):
             raise ValueError, "shape mismatch"
         dst[where] = src[where]
 
+# For some reason I was having trouble monkey-patching this into place, so oh
+# well, I'm lazy. I'll just tell the tests to use this version directly.
 def my_assert_array_equal(x, y, *args, **kwargs):
     x = asarray(x)
     y = asarray(y)
